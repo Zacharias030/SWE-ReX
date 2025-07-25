@@ -148,6 +148,11 @@ class ModalDeployment(AbstractDeployment):
         self._deployment_timeout = deployment_timeout
         if modal_sandbox_kwargs is None:
             modal_sandbox_kwargs = {}
+        else:
+            if isinstance(modal_sandbox_kwargs.get("cpu", None), list):
+                modal_sandbox_kwargs["cpu"] = tuple(modal_sandbox_kwargs["cpu"])
+            if isinstance(modal_sandbox_kwargs.get("memory", None), list):
+                modal_sandbox_kwargs["memory"] = tuple(modal_sandbox_kwargs["memory"])
         self._modal_kwargs = modal_sandbox_kwargs
         self._hooks = CombinedDeploymentHook()
 
@@ -217,6 +222,7 @@ class ModalDeployment(AbstractDeployment):
         self._hooks.on_custom_step("Starting modal sandbox")
         t0 = time.time()
         token = self._get_token()
+        print(self._modal_kwargs)
         self._sandbox = await modal.Sandbox.create.aio(
             "/usr/bin/env",
             "bash",
