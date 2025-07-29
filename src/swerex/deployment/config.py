@@ -114,6 +114,10 @@ class ModalDeploymentConfig(BaseModel):
     installing pipx might fail (or be slow).
     """
 
+    use_background_execution: bool = False
+    """If True, all commands will use background execution to avoid blocking the swerex-remote server.
+    This is useful for long-running commands that might cause HTTP timeouts etc."""
+
     model_config = ConfigDict(extra="forbid")
 
     def get_deployment(self) -> AbstractDeployment:

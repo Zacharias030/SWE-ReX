@@ -121,6 +121,7 @@ class ModalDeployment(AbstractDeployment):
         modal_sandbox_kwargs: dict[str, Any] | None = None,
         install_pipx: bool = True,
         deployment_timeout: float = 3600.0,
+        use_background_execution: bool = False,
     ):
         """Deployment for modal.com. The deployment will only start when the
         `start` method is being called.
@@ -135,6 +136,7 @@ class ModalDeployment(AbstractDeployment):
             runtime_timeout: The runtime timeout.
             deployment_timeout: The deployment timeout.
             modal_sandbox_kwargs: Additional arguments to pass to `modal.Sandbox.create`
+            use_background_execution: If True, all commands will use background execution
         """
         self._image = _ImageBuilder(install_pipx=install_pipx, logger=logger).auto(image)
         self._runtime: RemoteRuntime | None = None
@@ -146,6 +148,7 @@ class ModalDeployment(AbstractDeployment):
         self._user = _get_modal_user()
         self._runtime_timeout = runtime_timeout
         self._deployment_timeout = deployment_timeout
+        self._use_background_execution = use_background_execution
         if modal_sandbox_kwargs is None:
             modal_sandbox_kwargs = {}
         else:
@@ -168,6 +171,7 @@ class ModalDeployment(AbstractDeployment):
             runtime_timeout=config.runtime_timeout,
             deployment_timeout=config.deployment_timeout,
             modal_sandbox_kwargs=config.modal_sandbox_kwargs,
+            use_background_execution=config.use_background_execution,
         )
 
     def _get_token(self) -> str:
@@ -196,10 +200,22 @@ class ModalDeployment(AbstractDeployment):
         return await _wait_until_alive(self.is_alive, timeout=timeout, function_timeout=self._runtime._config.timeout)
 
     def _start_swerex_cmd(self, token: str) -> str:
-        """Start swerex-server on the remote. If swerex is not installed arelady,
+        """Start swerex-server on the remote. If swerex is not installed already,
         install pipx and then run swerex-server with pipx run
         """
         rex_args = f"--port {self._port} --auth-token {token}"
+        
+        # TODO(Zach): remove on merge!
+        if self._use_background_execution:
+            # For background execution support, install from our fork with the background execution feature
+            steps = [
+                "apt-get update -qq",
+                "apt-get install -y git",
+                f"pipx install git+https://github.com/Zacharias030/SWE-ReX.git@feature/background-execution --force",
+                f"{REMOTE_EXECUTABLE_NAME} {rex_args} --use-background-execution"
+            ]
+            return " && ".join(steps)
+        
         return f"{REMOTE_EXECUTABLE_NAME} {rex_args} || pipx run {PACKAGE_NAME} {rex_args}"
 
     async def get_modal_log_url(self) -> str:
@@ -222,12 +238,14 @@ class ModalDeployment(AbstractDeployment):
         self._hooks.on_custom_step("Starting modal sandbox")
         t0 = time.time()
         token = self._get_token()
-        print(self._modal_kwargs)
+        start_cmd = self._start_swerex_cmd(token)
+        self.logger.info(f"Running startup command: {start_cmd}")
+
         self._sandbox = await modal.Sandbox.create.aio(
             "/usr/bin/env",
             "bash",
             "-c",
-            self._start_swerex_cmd(token),
+            start_cmd,
             image=self._image,
             timeout=int(self._deployment_timeout),
             unencrypted_ports=[self._port],
@@ -244,7 +262,11 @@ class ModalDeployment(AbstractDeployment):
         self.logger.info(f"Starting runtime at {tunnel.url}")
         self._hooks.on_custom_step("Starting runtime")
         self._runtime = RemoteRuntime(
-            host=tunnel.url, timeout=self._runtime_timeout, auth_token=token, logger=self.logger
+            host=tunnel.url, 
+            timeout=self._runtime_timeout, 
+            auth_token=token, 
+            logger=self.logger,
+            use_background_execution=self._use_background_execution
         )
         remaining_startup_timeout = max(0, self._startup_timeout - elapsed_sandbox_creation)
         t1 = time.time()

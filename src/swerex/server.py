@@ -2,13 +2,17 @@
 
 import argparse
 import shutil
+import sys
 import tempfile
 import traceback
+import uuid
 import zipfile
 from pathlib import Path
+from typing import Dict
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exception_handlers import http_exception_handler
+from fastapi.logger import logger
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -21,6 +25,10 @@ from swerex.runtime.abstract import (
     Command,
     CreateSessionRequest,
     ReadFileRequest,
+    SubmitTaskRequest,
+    SubmitTaskResponse,
+    TaskStatusRequest,
+    TaskStatusResponse,
     UploadResponse,
     WriteFileRequest,
     _ExceptionTransfer,
@@ -28,10 +36,27 @@ from swerex.runtime.abstract import (
 from swerex.runtime.local import LocalRuntime
 
 app = FastAPI()
-runtime = LocalRuntime()
+runtime = None
+
+# Task registry
+BACKGROUND_TASKS: Dict[str, str] = {}  # task_id -> "running" status
+TASK_RESULTS: Dict[str, dict] = {}
+
 
 AUTH_TOKEN = ""
 api_key_header = APIKeyHeader(name="X-API-Key")
+
+
+async def run_background_task(task_id: str, action: Action):
+    """Run a command in the background and store the result."""
+    try:
+        result = await runtime.run_in_session(action)
+        TASK_RESULTS[task_id] = {"result": result, "error": None}
+    except Exception as e:
+        TASK_RESULTS[task_id] = {"result": None, "error": str(e)}
+    finally:
+        if task_id in BACKGROUND_TASKS:
+            del BACKGROUND_TASKS[task_id]
 
 
 def serialize_model(model):
@@ -83,6 +108,41 @@ async def create_session(request: CreateSessionRequest):
 @app.post("/run_in_session")
 async def run(action: Action):
     return serialize_model(await runtime.run_in_session(action))
+
+
+@app.post("/submit_task")
+async def submit_task(request: SubmitTaskRequest, background_task_runner: BackgroundTasks):
+    """Submit a command to run in the background."""
+    task_id = request.task_id or str(uuid.uuid4())
+    BACKGROUND_TASKS[task_id] = "running"
+
+    background_task_runner.add_task(run_background_task, task_id, request.action)
+    
+    print(f"Submitted background task {task_id}: {request.action.command[:50]}...", file=sys.stderr)
+    return SubmitTaskResponse(task_id=task_id)
+
+
+@app.post("/task_status")
+async def task_status(request: TaskStatusRequest):
+    """Check the status of a background task."""
+    task_id = request.task_id
+    
+    if task_id in BACKGROUND_TASKS:
+        logger.info(f"Task status check {task_id}: still running")
+        return TaskStatusResponse(is_done=False)
+    
+    if task_id in TASK_RESULTS:
+        result_data = TASK_RESULTS[task_id]
+        del TASK_RESULTS[task_id]
+        logger.info(f"Task status check {task_id}: completed")
+        return TaskStatusResponse(
+            is_done=True,
+            result=result_data["result"],
+            error=result_data["error"]
+        )
+
+    logger.info(f"Task status check {task_id}: not found")
+    return TaskStatusResponse(is_done=True, error="Task not found")
 
 
 @app.post("/close_session")
@@ -156,10 +216,15 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the server to")
     parser.add_argument("--port", type=int, default=8000, help="Port to run the server on")
     parser.add_argument("--auth-token", default="", help="token to authenticate requests", required=True)
+    parser.add_argument("--use-background-execution", action="store_true", 
+                       help="Enable background execution, useful for long-running commands.")
 
     args = parser.parse_args(remaining_args)
-    global AUTH_TOKEN
+    global AUTH_TOKEN, runtime
     AUTH_TOKEN = args.auth_token
+    
+    runtime = LocalRuntime(use_background_execution=args.use_background_execution)
+    
     uvicorn.run(app, host=args.host, port=args.port)
 
 
