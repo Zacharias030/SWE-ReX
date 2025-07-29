@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import multiprocessing as mp
 import os
 import re
 import shutil
@@ -52,7 +54,7 @@ from swerex.runtime.abstract import (
 from swerex.runtime.config import LocalRuntimeConfig
 from swerex.utils.log import get_logger
 
-__all__ = ["LocalRuntime", "BashSession"]
+__all__ = ["LocalRuntime", "BashSession", "NonBlockingBashSession"]
 
 
 def _split_bash_command(inpt: str) -> list[str]:
@@ -361,6 +363,123 @@ class BashSession(Session):
         self.shell.interact()
 
 
+
+
+def _bash_session_worker(request: CreateBashSessionRequest, input_queue: mp.Queue, output_queue: mp.Queue):
+    """Worker process function that runs a blocking BashSession.
+    
+    This function runs in a separate process and handles all the actual shell operations.
+    It receives actions via input_queue and sends results via output_queue.
+    """
+    try:
+        session = BashSession(request, logger=None)
+        start_result = asyncio.run(session.start())
+        output_queue.put(("start_result", start_result))
+        
+        while True:
+            try:
+                # Block until item arrives
+                item = input_queue.get()
+                
+                if item is None:  # shutdown
+                    break
+                    
+                action_type, action = item
+                
+                if action_type == "run":
+                    result = asyncio.run(session.run(action))
+                    output_queue.put(("result", result))
+                elif action_type == "close":
+                    close_result = asyncio.run(session.close())
+                    output_queue.put(("close_result", close_result))
+                    break
+                else:
+                    output_queue.put(("error", f"Unknown action type: {action_type}"))
+                    
+            except Exception as e:
+                output_queue.put(("error", str(e)))
+                
+    except Exception as e:
+        output_queue.put(("startup_error", str(e)))
+
+
+class NonBlockingBashSession(Session):
+    """Non-blocking version of BashSession using worker process + asyncio.to_thread().
+    
+    This class wraps a BashSession running in a separate process, and communicates with it
+    using multiprocessing queues.
+    """
+    
+    def __init__(self, request: CreateBashSessionRequest, *, logger: logging.Logger | None = None):
+        self.request = request
+        self.logger = logger or get_logger("rex-nonblocking-session")
+        
+        # IPC queues for communicating with worker process
+        self.input_queue: mp.Queue = mp.Queue()
+        self.output_queue: mp.Queue = mp.Queue()
+        
+        self.worker_process: mp.Process | None = None
+        
+    async def start(self) -> CreateBashSessionResponse:
+        """Start the worker process and initialize the shell session."""
+        self.worker_process = mp.Process(
+            target=_bash_session_worker,
+            args=(self.request, self.input_queue, self.output_queue)
+        )
+        self.worker_process.start()
+        
+        result_type, result = await asyncio.to_thread(self.output_queue.get)
+        
+        if result_type == "startup_error":
+            raise RuntimeError(f"Worker process startup failed: {result}")
+        elif result_type == "start_result":
+            return result
+        else:
+            raise RuntimeError(f"Unexpected startup result: {result_type}")
+    
+    async def run(self, action: BashAction | BashInterruptAction) -> BashObservation:
+        """Run a bash action in the worker process (non-blocking)."""
+        if self.worker_process is None:
+            raise RuntimeError("Session not started")
+            
+        await asyncio.to_thread(self.input_queue.put, ("run", action))
+        
+        result_type, result = await asyncio.to_thread(self.output_queue.get)
+        
+        if result_type == "error":
+            raise RuntimeError(f"Worker process error: {result}")
+        elif result_type == "result":
+            return result
+        else:
+            raise RuntimeError(f"Unexpected result type: {result_type}")
+    
+    async def close(self) -> CloseSessionResponse:
+        """Close the session and terminate worker process."""
+        if self.worker_process is None:
+            return CloseBashSessionResponse()
+            
+        try:
+            await asyncio.to_thread(self.input_queue.put, ("close", None))
+            
+            result_type, result = await asyncio.to_thread(self.output_queue.get)
+            
+            if result_type == "close_result":
+                close_response = result
+            else:
+                close_response = CloseBashSessionResponse()
+        except Exception:
+            close_response = CloseBashSessionResponse()
+        
+        if self.worker_process.is_alive():
+            await asyncio.to_thread(self.worker_process.join, timeout=2)
+            if self.worker_process.is_alive():
+                self.worker_process.terminate()
+                await asyncio.to_thread(self.worker_process.join)
+        
+        self.worker_process = None
+        return close_response
+
+
 class LocalRuntime(AbstractRuntime):
     def __init__(self, *, logger: logging.Logger | None = None, **kwargs: Any):
         """A Runtime that runs locally and actually executes commands in a shell.
@@ -392,7 +511,10 @@ class LocalRuntime(AbstractRuntime):
             msg = f"session {request.session} already exists"
             raise SessionExistsError(msg)
         if isinstance(request, CreateBashSessionRequest):
-            session = BashSession(request)
+            if self._config.use_background_execution:
+                session = NonBlockingBashSession(request)
+            else:
+                session = BashSession(request)
         else:
             msg = f"unknown session type: {request!r}"
             raise ValueError(msg)

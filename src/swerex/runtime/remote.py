@@ -2,6 +2,7 @@ import logging
 import shutil
 import sys
 import tempfile
+import asyncio
 import traceback
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ from swerex.exceptions import SwerexException
 from swerex.runtime.abstract import (
     AbstractRuntime,
     Action,
+    BashAction,
+    BashObservation,
     CloseResponse,
     CloseSessionRequest,
     CloseSessionResponse,
@@ -25,6 +28,10 @@ from swerex.runtime.abstract import (
     Observation,
     ReadFileRequest,
     ReadFileResponse,
+    SubmitTaskRequest,
+    SubmitTaskResponse,
+    TaskStatusRequest,
+    TaskStatusResponse,
     UploadRequest,
     UploadResponse,
     WriteFileRequest,
@@ -168,7 +175,46 @@ class RemoteRuntime(AbstractRuntime):
 
     async def run_in_session(self, action: Action) -> Observation:
         """Runs a command in a session."""
+        # Background execution is only supported for BashAction commands
+        if self._config.use_background_execution and isinstance(action, BashAction):
+            return await self.run_in_background_session(action)
+
         return self._request("run_in_session", action, Observation)
+
+    async def submit_task(self, action: Action, task_id: str | None = None) -> str:
+        """Submit a command to run in the background. Returns task_id."""
+        request = SubmitTaskRequest(action=action, task_id=task_id)
+        response = self._request("submit_task", request, SubmitTaskResponse)
+        return response.task_id
+
+    async def task_status(self, task_id: str) -> TaskStatusResponse:
+        """Get the status of a background task."""
+        request = TaskStatusRequest(task_id=task_id)
+        return self._request("task_status", request, TaskStatusResponse)
+
+    async def run_in_background_session(self, action: Action) -> Observation:
+        """Run action in background and asynchronously poll for completion."""
+        task_id = await self.submit_task(action)
+        self.logger.debug(f"Submitted task {task_id}: {action.command[:50]}...")
+        
+        # Start with 0.5s polling, gradually back off to 20s max
+        current_interval = 0.5
+        max_interval = 20.0
+        backoff_factor = 2
+        
+        while True:
+            status = await self.task_status(task_id)
+            self.logger.debug(f"Polling task {task_id}: is_done={status.is_done}")
+            if status.is_done:
+                if status.error:
+                    self.logger.error(f"Task {task_id} failed: {status.error}")
+                    raise SwerexException(status.error)
+                
+                self.logger.debug(f"Task {task_id} completed successfully")
+                return BashObservation(**status.result) if isinstance(status.result, dict) else status.result
+            
+            await asyncio.sleep(current_interval)
+            current_interval = min(current_interval * backoff_factor, max_interval)
 
     async def close_session(self, request: CloseSessionRequest) -> CloseSessionResponse:
         """Closes a shell session."""

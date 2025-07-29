@@ -282,3 +282,27 @@ class AbstractRuntime(ABC):
     async def close(self) -> CloseResponse:
         """Closes the runtime."""
         pass
+
+
+# Background task execution models
+class SubmitTaskRequest(BaseModel):
+    """Request to submit a task for background execution."""
+    action: Action
+    task_id: str | None = None
+
+
+class SubmitTaskResponse(BaseModel):
+    """Response from submitting a background task."""
+    task_id: str
+
+
+class TaskStatusRequest(BaseModel):
+    """Request to check the status of a background task."""
+    task_id: str
+
+
+class TaskStatusResponse(BaseModel):
+    """Response with the status of a background task."""
+    is_done: bool
+    result: Any | None = None
+    error: str | None = None

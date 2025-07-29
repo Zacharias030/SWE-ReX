@@ -12,6 +12,9 @@ class LocalRuntimeConfig(BaseModel):
 
     type: Literal["local"] = "local"
     """Discriminator for (de)serialization/CLI. Do not change."""
+    
+    use_background_execution: bool = False
+    """If True, use NonBlockingBashSession instead of regular BashSession."""
 
     def get_runtime(self) -> AbstractRuntime:
         from swerex.runtime.local import LocalRuntime
@@ -28,6 +31,8 @@ class RemoteRuntimeConfig(BaseModel):
     """The port to connect to."""
     timeout: float = 0.15
     """The timeout for the runtime."""
+    use_background_execution: bool = False
+    """If True, all commands will use background execution to avoid HTTP timeouts."""
 
     type: Literal["remote"] = "remote"
     """Discriminator for (de)serialization/CLI. Do not change."""
